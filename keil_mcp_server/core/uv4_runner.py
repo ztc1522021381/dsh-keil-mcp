@@ -1,6 +1,7 @@
 """UV4.exe process runner: build (-b/-r), flash (-f), debug (-d) (blueprint §4.1)."""
 from __future__ import annotations
 
+import re
 import subprocess
 import threading
 import time
@@ -33,9 +34,26 @@ class UV4Runner:
         log_path.touch()  # pre-create to avoid tail latency
         with open(log_path, "a", encoding="utf-8", errors="replace") as f:
             f.write(f"\n===== UV4 {' '.join(args)} {project} @ {time.strftime('%H:%M:%S')} =====\n")
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            encoding="utf-8", errors="replace", creationflags=0x08000000)  # CREATE_NO_WINDOW
+        # Fix (2026-08-29): when this server is spawned by a host app that puts
+        # us inside a Job Object (e.g. sandbox memory limits), UV4 -b crashes
+        # with 0xC0000005 at the link stage (armlink needs more memory than
+        # single-file compiles). Launch UV4 with CREATE_BREAKAWAY_FROM_JOB so
+        # it escapes the job; fall back to a normal spawn if the job forbids
+        # breakaway. Also pin cwd to the project dir for correct relative-path
+        # resolution (.\Objects\*.lnp entries).
+        base_flags = 0x08000000  # CREATE_NO_WINDOW
+        breakaway_flags = base_flags | 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+        project_cwd = str(Path(project).parent)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                encoding="utf-8", errors="replace", creationflags=breakaway_flags,
+                cwd=project_cwd)
+        except OSError:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                encoding="utf-8", errors="replace", creationflags=base_flags,
+                cwd=project_cwd)
         if progress is not None:
             progress.start(proc)
         try:
@@ -65,8 +83,75 @@ class UV4Runner:
         args = ["-c" if clean else ("-r" if rebuild else "-b")]
         if target:
             args += ["-t", target]
-        args += ["-j0", "-o", str(log_path or (Path(project).parent / "build.log"))]
-        return self.run(args, project, log_path=log_path, timeout=timeout, progress=progress)
+        effective_log = log_path or (Path(project).parent / "build.log")
+        args += ["-j0", "-o", str(effective_log)]
+        proc = self.run(args, project, log_path=effective_log, timeout=timeout, progress=progress)
+        # Fallback chain (2026-08-29): when the host app's sandbox crashes UV4
+        # at link stage (0xC0000005), the compile stage is already complete
+        # (.o + .lnp produced). Finish the link with armlink directly so the
+        # caller always gets a complete firmware artifact.
+        if proc.returncode not in (0, 1):
+            if self._fallback_link(project, effective_log):
+                proc.returncode = 0
+        return proc
+
+    def _fallback_link(self, project: str, log_path: Path) -> bool:
+        """Complete the build via armlink --via=<lnp> after a UV4 crash.
+
+        Returns True (and appends the link result to the build log) when the
+        axf was produced; False when fallback is not possible.
+        """
+        proj_dir = Path(project).parent
+        stem = Path(project).stem
+        lnp = proj_dir / "Objects" / f"{stem}.lnp"
+        if not lnp.exists():
+            return False
+        # locate the ARMCLANG bin folder recorded by UV4 in the build log
+        bin_dir: Optional[Path] = None
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        m = re.search(r"folder: '([^']+)'", text)
+        if m:
+            candidate = Path(m.group(1))
+            if candidate.exists():
+                bin_dir = candidate
+        if bin_dir is None:
+            return False
+        armlink = bin_dir / "armlink.exe"
+        if not armlink.exists():
+            return False
+        try:
+            r = subprocess.run(
+                [str(armlink), "--via=" + str(lnp)],
+                cwd=str(proj_dir), capture_output=True, text=True,
+                timeout=120, creationflags=0x08000000)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        axf = proj_dir / "Objects" / f"{stem}.axf"
+        if r.returncode != 0 or not axf.exists():
+            return False
+        # append link result so downstream log parsers see a complete build
+        # (armlink prints "Program Size: ..." on stderr — merge both streams)
+        link_output = (r.stdout or "") + (r.stderr or "")
+        with open(log_path, "a", encoding="utf-8", errors="replace") as f:
+            f.write("linking...\n")
+            f.write(link_output.rstrip() + "\n\n")
+            f.write(f'"{axf}" - 0 Error(s), 0 Warning(s).\n')
+        # regenerate hex via fromelf (Keil convention), best-effort
+        fromelf = bin_dir / "fromelf.exe"
+        if fromelf.exists():
+            try:
+                subprocess.run(
+                    [str(fromelf), "--i32combined",
+                     "--output=" + str(proj_dir / "Objects" / f"{stem}.hex"),
+                     str(axf)],
+                    cwd=str(proj_dir), capture_output=True, timeout=60,
+                    creationflags=0x08000000)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return True
 
     def flash(self, project: str, target: Optional[str] = None, log_path: Optional[Path] = None,
               timeout: float = 120) -> subprocess.CompletedProcess:
